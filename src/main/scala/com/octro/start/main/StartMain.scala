@@ -1,0 +1,451 @@
+package com.octro.start.main
+
+import com.google.gson.{Gson, JsonObject, JsonParser, JsonPrimitive}
+import com.typesafe.config.ConfigFactory
+import org.apache.hadoop.conf.Configuration
+import org.apache.hadoop.fs.{FileSystem, Path}
+import org.apache.spark.rdd.RDD
+import org.apache.spark.sql.functions._
+import org.apache.spark.{SparkConf, SparkContext, sql}
+import org.apache.spark.sql.{DataFrame, Row, SQLContext, SparkSession, functions}
+import org.joda.time.{DateTime, Days}
+import scalaj.http.Http
+import org.apache.hadoop.hbase.{HBaseConfiguration, TableName}
+import org.apache.hadoop.hbase.util.Bytes
+import com.octro.utilities.{Format, Notifier, OPrinter}
+import com.octro.utilities.HbaseConnectionUtilProd
+import com.octro.utilities.OKafkaProducer
+import org.joda.time.format.DateTimeFormat
+//import com.octro.utils.OKafkaProducer
+import org.apache.commons.lang.exception.ExceptionUtils
+import com.google.gson.JsonNull
+import org.apache.hadoop.hbase.TableName
+import org.apache.hadoop.hbase.client.{Append, Get, HTable, Increment, Put, Result, Scan, Table}
+
+
+object StartMain {
+  val dgnOvsTopic = "dgn_events" //"DGN-Events"
+  val dgn_map_userid_gocid_tbl = "dgn_ovs_userid_gocid"
+  val dgn_map_gocid_userid_tbl = "dgn_ovs_gocid_userid"
+
+
+  def main(args: Array[String]): Unit = {
+    OPrinter.logAndPrint("*************** Welcome to DGN Connector ***************")
+
+    //    val conf = new SparkConf()
+    //      .set("spark.streaming.backpressure.enabled", "true")
+    //      .set("spark.streaming.kafka.maxRatePerPartition", "500") //100000 //50000 //25000  *60 (duration)
+    //      .set("spark.ui.port", "4545")
+    //      .set("spark.executor.memoryOverhead", "100m")
+    //      .set("spark.hadoop.fs.defaultFS", "hdfs://192.168.123.123:9000")
+
+    val conf = new SparkConf()
+      .set("spark.streaming.backpressure.enabled", "true")
+      .set("spark.streaming.kafka.maxRatePerPartition", "50") //100000 //50000 //25000  *60 (duration)
+      .set("com.couchbase.nodes", "serv98.octro.net:8091") //For CouchBase
+      .set("spark.ui.port", "4545")
+      .set("spark.executor.memoryOverhead", "100m")
+      .set("spark.hadoop.fs.defaultFS", "hdfs://octropc")
+    //      .set("com.couchbase.bucket.teenpatti_test", "sonic12345")
+
+    val sc = new SparkContext(conf)
+    val spark = new SQLContext(sc).sparkSession
+    println("Application id=" + sc.applicationId)
+    import spark.implicits._
+
+//    val todayDay = new DateTime().withTimeAtStartOfDay()
+//    val start_date = "2024/01/23" //todayDay.minusDays(1).toString(Format.dayFmt).replace("-","/")
+
+   // s"/tmp/amar/s3_dgn_test/ovs/events/prod/$start_date"
+    val hourPaths = List("00", "01", "02","03", "04","05", "06", "07", "08", "09", "10", "11", "12", "13", "14", "15", "16", "17", "18", "19", "20", "21", "22", "23")
+    val eventNames = List("transaction", "level_up", "install", "start_session", "worlds", "spin", "facebook_connect")
+
+    val transnCol = List("purchase_count", "price", "session_id", "event_id")
+    val levelUpCol = List("session_id", "level", "vip_level", "event_id")
+    val installCol = List("session_id", "event_id")
+    val startSesCol = List("version", "balance", "bingo_balls_balance", "platform_id", "blackdiamond_elite_active", "session_id", "event_id")
+    val worldsCol = List("session_id", "last_unlocked_world", "event_id")
+    val spinCol = List("bet_amount", "event_id", "session_id")
+    val facebookConnectCol = List("session_id", "facebook_id", "event_id")
+
+    var mapperEventCol: Map[String, List[String]] = Map("transaction" -> transnCol, "level_up" -> levelUpCol, "install" -> installCol, "start_session" -> startSesCol, "worlds" -> worldsCol, "spin" -> spinCol, "facebook_connect" -> facebookConnectCol)
+
+    var colList: Map[String, List[String]] = Map()
+
+    for (event <- eventNames) {
+      if (event.equalsIgnoreCase("transaction")) {
+        colList = colList + (event -> transnCol)
+      }
+      if (event.equalsIgnoreCase("level_up")) {
+        colList = colList + (event -> levelUpCol)
+      }
+      if (event.equalsIgnoreCase("install")) {
+        colList = colList + (event -> installCol)
+      }
+      if (event.equalsIgnoreCase("start_session")) {
+        colList = colList + (event -> startSesCol)
+      }
+      if (event.equalsIgnoreCase("worlds")) {
+        colList = colList + (event -> worldsCol)
+      }
+      if (event.equalsIgnoreCase("spin")) {
+        colList = colList + (event -> spinCol)
+      }
+      if (event.equalsIgnoreCase("facebook_connect")) {
+        colList = colList + (event -> facebookConnectCol)
+      }
+    }
+
+        val lastReadPath = spark.read.text("/tmp/simran/dgn_ovs_lastReadData.txt").head.getAs[String]("value")  //.first().getString(0)
+        val lastHourRead = lastReadPath.substring(lastReadPath.lastIndexOf("/") + 1)
+
+        OPrinter.logAndPrint(s"lastHourRead is $lastHourRead")
+        OPrinter.logAndPrint(s"hourPaths is $hourPaths")
+        // Find the index of last read hour in the original hour list
+        val index = hourPaths.indexOf(lastHourRead)
+        OPrinter.logAndPrint(s"index is $index")
+        // Create a new list from that index onwards for hour paths to be read onwards
+        val hourPathToRead = hourPaths.drop(index + 1)
+        OPrinter.logAndPrint(s"Line 92 is $hourPathToRead")
+        var status= ""
+
+    val dateFormat = DateTimeFormat.forPattern("yyyy/MM/dd")
+
+    // Define start and end dates
+    val startDate = dateFormat.parseDateTime("2024/01/23")
+    val endDate = dateFormat.parseDateTime("2024/02/04")
+
+    // Calculate the number of days between the start and end dates
+    val daysBetween = Days.daysBetween(startDate, endDate).getDays()
+
+    // Iterate over each day and print the date
+    for (day <- 0 to daysBetween) {
+      val currentDate = startDate.plusDays(day).toString(dateFormat)
+      val dayPathToRead = s"/tmp/amar/dgn_ovs_events/ovs/events/prod/$currentDate"
+      println(s"Date: $currentDate")
+
+      if (lastHourRead == "23") {
+        OPrinter.logAndPrint(s"Inside if hourPathToRead is $hourPaths")
+        status = hourwiseDataReader(hourPaths, spark, dayPathToRead, eventNames, mapperEventCol, currentDate)
+      }
+      else {
+        OPrinter.logAndPrint(s"Inside else hourPathToRead is $hourPathToRead")
+        status = hourwiseDataReader(hourPathToRead, spark, dayPathToRead, eventNames, mapperEventCol, currentDate)
+      }
+      OPrinter.logAndPrint(s"Data proccessed for $currentDate " + status)
+    }
+
+  }
+
+  def hourwiseDataReader(hourPathToRead: List[String], spark: SparkSession, dayPathToRead: String, eventNames: List[String], mapperEventCol: Map[String, List[String]], start_date: String): String = {
+    import spark.implicits._
+
+    if (hourPathToRead.size != 0) {
+
+      hourPathToRead.foreach(hour => {
+
+        try {
+          var no_of_hits = 0
+
+          OPrinter.logAndPrint(s"Reading data for path $dayPathToRead/$hour/*")
+          val df = spark.read.json(s"$dayPathToRead/$hour/*").filter(col("event_type").isin(eventNames: _*))
+          OPrinter.logAndPrint("No. of records  " + df.count())
+          //      df.show(1,false)
+
+          val schemaJson = spark.read.text("hdfs://192.168.123.123:9000/tmp/simran/schema.txt").toDF("col")
+          //      schemaJson.show(2,false)
+          schemaJson.printSchema
+
+          val splitDF = schemaJson.withColumn("column_name", functions.split($"col", ":")(0))
+            .withColumn("column_type", functions.split($"col", ":")(1))
+            .drop("col")
+          //      splitDF.show(2,false)
+
+          val colSchema = splitDF.collect().map { (row: Row) =>
+            val column = row.getString(0)
+            val datatype = row.getString(1)
+
+            // Create a map for each row
+            (column.trim(), datatype.trim())
+          }.toMap
+
+          //      colSchema.foreach(println)
+
+          val jsonData = df.toJSON.rdd
+          OPrinter.logAndPrint("RDD[String] as :")
+          jsonData.take(1).foreach(println)
+
+          var retRDD = jsonData.mapPartitions(partition => {
+            val connection = HbaseConnectionUtilProd.getConnection()
+            val useridToGocidHbaseTbl = connection.getTable(TableName.valueOf(dgn_map_userid_gocid_tbl))
+            val gocidToUseridHbaseTbl = connection.getTable(TableName.valueOf(dgn_map_gocid_userid_tbl))
+
+
+            val newRDD = partition.map(row => {
+              if (row != null && row.contains("event_type") && row.contains("ts") && row.contains("user_id") && row.contains("numeric_user_id")) {
+                OPrinter.logAndPrint("For row: " + row)
+                val gson = new Gson()
+                val jsonObject: JsonObject = gson.fromJson(row, classOf[JsonObject])
+
+                val event_name = jsonObject.get("event_type").getAsString
+                val epoch_time = jsonObject.get("ts").getAsLong
+                val hashed_user_id = jsonObject.get("user_id").getAsString
+                val ref_user_id = jsonObject.get("numeric_user_id").getAsString
+                val game_id = "dgn_ovs"
+
+
+                val rowkey = ref_user_id.trim()
+                var getUserData = (rowkey, useridToGocidHbaseTbl.get(new Get(Bytes.toBytes(rowkey))))
+
+                OPrinter.logAndPrint(s"Get data from hbase table $ref_user_id")
+                var gocid_from_hbase = ""
+                try {
+                  gocid_from_hbase = Bytes.toString(getUserData._2.getValue(Bytes.toBytes("data"), Bytes.toBytes("goc_id"))).toString()
+                } catch {
+                  case e: Exception => {
+                    OPrinter.logAndPrint("Inside catch")
+                  }
+                }
+                OPrinter.logAndPrint(s"Get data from hbase table $gocid_from_hbase")
+
+                var hbasePut = new Put(Bytes.toBytes(ref_user_id))
+
+                val event_time = Format.epochToDateTime(epoch_time)
+
+
+                OPrinter.logAndPrint("Line 131" + row)
+                OPrinter.logAndPrint("event_name" + event_name)
+
+                val colList = mapperEventCol(event_name)
+
+                //            if(event_name.equalsIgnoreCase("level_up")){
+                var eventValueJson = new JsonObject
+                for (col <- colList) {
+                  //                  OPrinter.logAndPrint(s"$col: $colSchema.get(col)")
+                  val dataType = colSchema(col)
+                  val extractedValue: Any = dataType match {
+                    case "string" => {
+                      Option(jsonObject.get(col)) match {
+                        case Some(jsonElement) =>
+                          val value = jsonElement.getAsString
+                          eventValueJson.add(col, new JsonPrimitive(value))
+                        case None =>
+                          eventValueJson.add(col, JsonNull.INSTANCE)
+                      }
+                    }
+                    case "long" => {
+                      Option(jsonObject.get(col)) match {
+                        case Some(jsonElement) =>
+                          val value = jsonElement.getAsLong
+                          eventValueJson.add(col, new JsonPrimitive(value))
+                        case None =>
+                          eventValueJson.add(col, JsonNull.INSTANCE)
+                      }
+                    }
+                    case "boolean" => {
+                      Option(jsonObject.get(col)) match {
+                        case Some(jsonElement) =>
+                          val value = jsonElement.getAsBoolean
+                          eventValueJson.add(col, new JsonPrimitive(value))
+                        case None =>
+                          eventValueJson.add(col, JsonNull.INSTANCE)
+                      }
+                    }
+                    case "double" => {
+                      Option(jsonObject.get(col)) match {
+                        case Some(jsonElement) =>
+                          val value = jsonElement.getAsDouble
+                          eventValueJson.add(col, new JsonPrimitive(value))
+                        case None =>
+                          eventValueJson.add(col, JsonNull.INSTANCE)
+                      }
+                    }
+                    case "array" => {
+                      Option(jsonObject.get(col)) match {
+                        case Some(jsonElement) =>
+                          val value = jsonElement.getAsJsonObject
+                          eventValueJson.add(col, value)
+                        case None =>
+                          eventValueJson.add(col, JsonNull.INSTANCE)
+                      }
+                    }
+                    case _ => {
+                      OPrinter.logAndPrint(s"for column $col else datatype: $dataType \n row $row")
+                      throw new IllegalArgumentException(s"Unsupported data type: $dataType")
+                    }
+                  }
+
+                  //              val extractedValue: Any = dataType match {
+                  //                case "string" => {
+                  //                  val value = jsonObject.get(col).getAsString
+                  //                  eventValueJson.add(col, new JsonPrimitive(value))
+                  //
+                  //                }
+                  //                case "long" => {
+                  //                  val value = jsonObject.get(col).getAsLong
+                  //                  eventValueJson.add(col, new JsonPrimitive(value))
+                  //                }
+                  //                case "boolean" => {
+                  //                  val value = jsonObject.get(col).getAsBoolean
+                  //                  eventValueJson.add(col, new JsonPrimitive(value))
+                  //
+                  //                }
+                  //                case "double" => {
+                  //                  val value = jsonObject.get(col).getAsDouble
+                  //                  eventValueJson.add(col, new JsonPrimitive(value))
+                  //                }
+                  //                case "array" => {
+                  //                  val value = jsonObject.get(col).getAsJsonObject
+                  //                  eventValueJson.add(col, value)
+                  //                }
+                  //                case _ => {
+                  //                  OPrinter.logAndPrint(s"for column $col else datatype: $dataType \n row $row")
+                  //                  throw new IllegalArgumentException(s"Unsupported data type: $dataType")
+                  //                }
+                  //              }
+
+                }
+                eventValueJson.add("epoch_time", new JsonPrimitive(epoch_time))
+                eventValueJson.add("event_time", new JsonPrimitive(event_time))
+                eventValueJson.add("user_id_hashed", new JsonPrimitive(hashed_user_id))
+                eventValueJson.add("user_id_ref", new JsonPrimitive(ref_user_id))
+
+                var goc_id = ""
+                if (gocid_from_hbase != "") {
+                  OPrinter.logAndPrint("Inside if line 251: " + gocid_from_hbase)
+                  goc_id = gocid_from_hbase
+                }
+                else {
+                  OPrinter.logAndPrint("inside else")
+                  no_of_hits = no_of_hits + 1
+                  val response = getGOCIDfromUSERID(ref_user_id)
+                  val outerJson = stringToJsonConverter(response)
+                  val innerJson = outerJson.get("body").getAsJsonObject
+                  goc_id = innerJson.get("GOCID").getAsString
+                  if (goc_id != "") {
+                    OPrinter.logAndPrint("Inside if line 262: " + goc_id)
+                    hbasePut.addColumn("data".getBytes, "goc_id".getBytes, goc_id.toString().getBytes)
+
+                    useridToGocidHbaseTbl.put(hbasePut)
+                  }
+
+                  // Now putting user_id corresponding to this goc_id in dgn_map_gocid_userid_tbl
+                  val hbasePut2 = new Put(Bytes.toBytes(goc_id))
+                  hbasePut2.addColumn("data".getBytes, "user_id".getBytes, ref_user_id.toString().getBytes)
+                  gocidToUseridHbaseTbl.put(hbasePut2)
+
+                }
+
+                val mainJson = new JsonObject
+                mainJson.addProperty("game_id", game_id)
+                mainJson.addProperty("event_time", event_time)
+                mainJson.addProperty("event_name", event_name)
+                mainJson.addProperty("user_id", goc_id)
+                mainJson.add("event_value", eventValueJson)
+
+                OPrinter.logAndPrint("Value of no. of API hits for this hour: " + no_of_hits)
+                (mainJson.toString, game_id, goc_id, event_time, event_name, eventValueJson.toString)
+                //            (event_name, event_time, game_id, hashed_user_id, eventValueJson.toString)
+              }
+              else {
+                OPrinter.logAndPrint("Else row" + row)
+                ("", "", "", "", "", "")
+              }
+            }).filter(x => x != null)
+            newRDD
+          }).coalesce(1).persist()
+
+          OPrinter.logAndPrint(s"Row count for $hour " + retRDD.count())
+          OPrinter.logAndPrint(s"Putting Data for hour $hour of day $start_date")
+          retRDD.map(x => x._1).take(2).foreach(println)
+          OPrinter.logAndPrint(s"Pushing $hour hour data to kafka topic $dgnOvsTopic")
+          OKafkaProducer.pushToTopic(dgnOvsTopic, retRDD.map(x => x._1))
+          OPrinter.logAndPrint(s"Data saved to kafka topic $dgnOvsTopic")
+
+          OPrinter.logAndPrint("Writing last read path on HDFS" + "!!")
+          writeLastReadPathOnHDFS(s"/$hour", "/tmp/simran")
+
+          retRDD.unpersist()
+        }
+        catch {
+          case e: Exception => {
+            val stackTrace = "com.octro.start.main.StartMain :: " + ExceptionUtils.getStackTrace(e) + "<br/><br/>"
+            Notifier.sendEMail("dgn_ovs@octro.com", s"Error occurred in dgn_ovs connector for date $start_date hour $hourPathToRead " + "\n<br/>" + e.getMessage + "\n<br/>stackTrace = " + stackTrace, "simran.maurya@octrotalk.com", "Action required : Couldn't process dgn-ovs data")
+            OPrinter.logAndPrint(e.getMessage)
+          }
+        }
+
+      })
+    }
+    "\n done"
+  }
+
+  def writeLastReadPathOnHDFS(hour: String, path: String): Unit = {
+    OPrinter.logAndPrint("Inside writeLastReadPathOnHDFS")
+    val today = DateTime.now(Format.utcZone).toString(Format.dayFmt)
+    val hadoopConf = new org.apache.hadoop.conf.Configuration()
+    hadoopConf.set("fs.defaultFS", "hdfs://octropc")
+    val hdfs = org.apache.hadoop.fs.FileSystem.get(hadoopConf)
+    val hdfsDir = new org.apache.hadoop.fs.Path(path)
+
+    if (!hdfs.exists(hdfsDir)) {
+      hdfs.mkdirs(hdfsDir)
+    }
+
+    val hdfsFilePath = s"${path}/dgn_ovs_lastReadData.txt"
+    val hdfsFile = new org.apache.hadoop.fs.Path(hdfsFilePath)
+
+    // Create the file or overwrite if it already exists
+    val out = hdfs.create(hdfsFile, true)
+    // Write the content to the file
+    var finalHour = hour
+    //    if(hour=="/23")
+    //      {
+    //        finalHour= "/24"
+    //      }
+    out.writeChars(finalHour)
+    // Close the stream
+    out.close()
+  }
+
+  def getGOCIDfromUSERID(userId: String): String = {
+    val gocidEndPoint = "http://ts017.octro.com:3010/userprovision/guestReg"
+    val action = "guestReg"
+    val guestId = userId
+    val gameId = "1"
+    val data_from = "dwbsid"
+
+    try {
+      val response = Http(gocidEndPoint)
+        .postForm
+        .param("action", action)
+        .param("guestId", guestId)
+        .param("gameId", gameId)
+        .param("data_from", data_from)
+        .asString
+      //    println("API response body = " + response.body)
+      //    println("API response code = " + response.code)
+      val res_body = response.body
+      res_body
+    }
+    catch {
+      case e: Exception => {
+        val stackTrace = "com.octro.start.main.StartMain :: " + ExceptionUtils.getStackTrace(e) + "<br/><br/>"
+        Notifier.sendEMail("dgn_ovs@octro.com", s"Error occurred while fetching gocid for userid $guestId  " + "\n<br/>" + e.getMessage + "\n<br/>stackTrace = " + stackTrace, "simran.maurya@octrotalk.com", "Action required : Couldn't fetch gocid from api")
+        ""
+      }
+    }
+    //    println("res_body type : "+res_body.getClass().getSimpleName())
+  }
+
+  private def stringToJsonConverter(json: String): JsonObject = {
+    val jsonParser = new JsonParser()
+    val json_element = jsonParser.parse(json)
+    val json_data = json_element.getAsJsonObject
+    json_data
+  }
+
+}
+
+
+
