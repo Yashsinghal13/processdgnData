@@ -26,6 +26,8 @@ import com.google.gson.JsonNull
 import org.apache.hadoop.hbase.TableName
 import org.apache.hadoop.hbase.client.{Append, Get, HTable, Increment, Put, Result, Scan, Table}
 import java.security.MessageDigest
+import org.apache.hadoop.fs.{FileSystem, Path}
+import java.io.OutputStreamWriter
 
 object DgnOvsEventsV2 {
   val dgnLtsTopic = "dgn_lts_events" //"DGN-Events"
@@ -88,9 +90,9 @@ object DgnOvsEventsV2 {
     val end_time = DateTime.now(Format.utcZone)
     val start_time = end_time.minusHours(600)
     var current_time = start_time
-    val hourmap: mutable.Map[String, List[(String, Boolean)]] = mutable.Map()
+    val dateMap: mutable.Map[String, List[List[(String, Boolean)]]] = mutable.Map() //"2025/03/01 ----> [[(path1,false),(path2,false),(path3,false)],[(path1,false),(path2,false),(path3,false)],[],[],[],[],[],[],[],[],[],[],[],[],[],[],[]]
     while (current_time.isBefore(end_time) || current_time.isEqual(end_time)) {
-      val hourpath = current_time.toString(Format.hourFmt)
+      val hourpath = current_time.toString(Format.hourFmt) //2025/03/01/00
       OPrinter.logAndPrint(current_time.toString(Format.hourFmt))
       current_time = current_time.plusHours(1)
       val finalPath = "/dgn/ovs/raw_events/ovs/events/prod/" + hourpath
@@ -102,13 +104,21 @@ object DgnOvsEventsV2 {
           val current = DateTime.now(Format.utcZone)
           Minutes.minutesBetween(filetimestamp, current).getMinutes > 5
         }
-        .foreach { case (filePath, _) =>
-          val cleanedPath = filePath.substring(filePath.indexOf("/dgn"))
-          hourmap(hourpath) = hourmap.getOrElse(hourpath, List()) :+ (cleanedPath, false)
-        }
+      val date = hourpath.take(10) // "2025/03/01"
+      val hour = hourpath.takeRight(2).toInt // "00"
+      if (!dateMap.contains(date)) {
+        dateMap(date) = List.fill(24)(List.empty[(String, Boolean)]) // Initialize with 24 empty lists
+      }
+      // Update the inner list
+      var updatedInnerList = dateMap(date)(hour)
+      filteredPathList.foreach { case (filePath, _) =>
+        val cleanedPath = filePath.substring(filePath.indexOf("/dgn"))
+        updatedInnerList = updatedInnerList :+ (cleanedPath, false)
+      }
+      dateMap(date) = dateMap(date).updated(hour, updatedInnerList)
+      filteringAlreadyProcessedPath(dateMap)
+      hourwiseDataReader(dateMap, spark, eventNames, mapperEventCol, numPartitions)
     }
-    filteringAlreadyProcessedPath(hourmap)
-    hourwiseDataReader(hourmap,spark,eventNames,mapperEventCol,numPartitions)
   }
   def listHdfsFilesWithModificationTime(directoryPath: String): List[(String, String)] = {
     val conf = new Configuration()
@@ -127,57 +137,35 @@ object DgnOvsEventsV2 {
       List.empty
     }
   }
-  def filteringAlreadyProcessedPath(hourmap: mutable.Map[String, List[(String, Boolean)]]): Unit = {
-    val connection = HbaseConnectionUtilProd.getConnection()
-    val tableName = "already_processed_paths"
-    val table = connection.getTable(TableName.valueOf(tableName))
-    println("Read data from successfully with hbase")
-    val hbaseData: mutable.Map[String, List[String]] = mutable.Map()
-    hourmap.foreach {
-      case (datehour, fileList) =>
-        val date = datehour.take(10)
-        val hour = datehour.takeRight(2)
-        val columnFamily="hour_data"
-        val get = new Get(Bytes.toBytes(date))
-        val result: Result = table.get(get)
-        var valuesList: List[String] = List.fill(23)("")
-        val qualifiers = (0 to 23).map(i => f"$i%02d").toList
-        if (!result.isEmpty) {
-          valuesList = qualifiers.map { qualifier =>
-            val value = result.getValue(Bytes.toBytes(columnFamily), Bytes.toBytes(qualifier))
-            if (value != null) Bytes.toString(value) else "" // Handle null values
+  def filteringAlreadyProcessedPath(dateMap: mutable.Map[String, List[List[(String, Boolean)]]]): Unit = {
+      val connection = HbaseConnectionUtilProd.getConnection()
+      val tableName = "already_processed_paths"
+      val table = connection.getTable(TableName.valueOf(tableName))
+      println("Read data from successfully with hbase")
+      val hbaseData: mutable.Map[String, List[String]] = mutable.Map()
+      dateMap.foreach {
+        case (date, fileList) =>
+          val columnFamily = "hour_data"
+          val get = new Get(Bytes.toBytes(date))
+          val result: Result = table.get(get)
+          if (!result.isEmpty) {
+            for (i <- 0 to 23) {
+              val hour = f"$i%02d"
+              val value = result.getValue(Bytes.toBytes(columnFamily), Bytes.toBytes(hour))
+              if (result.containsColumn(Bytes.toBytes(columnFamily), Bytes.toBytes(hour))) {
+                val processedPaths = Bytes.toString(value).split(',').toSet
+                //println(processedPaths)
+                val updatedFileList = dateMap(date)(i).map {
+                  case (path, existence) => (path, processedPaths.contains(path))
+                }
+                dateMap(date) = dateMap(date).updated(i, updatedFileList)
+              }
+            }
           }
-          for(i<-0 to 23) {
-            val processedPaths = if (qualifiers!="") {
-              value.split(",").toSet
-            } else {
-              Set.empty[String]
-          }
-          hbaseData.update(date, valuesList)
-        } else {
-          println(s"No data found for row key: $date")
-        }
-//        val date = datehour.take(10)
-//        val columnFamily = "hour_data"
-//        val columnQualifier = hour
-//        val get = new Get(Bytes.toBytes(date))
-//        get.addColumn(Bytes.toBytes(columnFamily), Bytes.toBytes(columnQualifier))
-//        val result = table.get(get)
-        val processedPaths = if (!result.isEmpty) {
-          Bytes.toString(result.getValue(Bytes.toBytes(columnFamily), Bytes.toBytes(columnQualifier))).split(",").toSet
-        } else {
-          Set.empty[String]
-        }
-        val updatedFileList = hourmap(datehour).map {
-          case (path, existence) => (path, processedPaths.contains(path))
-          //println(path, processedPaths.contains(path))
-        }
-        hourmap.update(datehour, updatedFileList)
-      //println(hourmap)
+      }
+      println("Hourmap updated Successfully")
     }
-    println("Hour MAP updated Successfully")
-  }
-  def hourwiseDataReader(hourPathToRead: mutable.Map[String, List[(String, Boolean)]], spark: SparkSession, eventNames: List[String], mapperEventCol: Map[String, List[String]], numPartitions: Int): Unit = {
+  def hourwiseDataReader(dateMap: mutable.Map[String, List[List[(String, Boolean)]]], spark: SparkSession, eventNames: List[String], mapperEventCol: Map[String, List[String]], numPartitions: Int): Unit = {
     import spark.implicits._
     val connection = HbaseConnectionUtilProd.getConnection()
     val tableName = "already_processed_paths"
@@ -185,245 +173,247 @@ object DgnOvsEventsV2 {
     println("Connection made Successfully for write");
     val accum = spark.sparkContext.longAccumulator("api_hits")
     try {
-      hourPathToRead.foreach {
-        case (datehour, fileList) =>
-          val date=datehour.take(10)
-          val hour=datehour.takeRight(2)
-          val filepaths = ListBuffer[String]()
-          val allPaths =ListBuffer[String]()
-          fileList.foreach { case (path, flag) =>
-            if (!flag) {
-              filepaths += path
-            }
-            allPaths += path
-          }
-          OPrinter.logAndPrint(s"Number of file need to processed for the path datehour ${datehour} ${filepaths.size}")
-          if (filepaths.nonEmpty) {
-            println(s"Processing files for hour: $hour")
-            val jsonRDD = spark.sparkContext.textFile(filepaths.mkString(",")).flatMap(json => json.split("\\*##\\*")).map(strr => strr.slice(strr.indexOf("{"), strr.lastIndexOf("}") + 1))
-            val df = spark.read.json(jsonRDD).filter(col("event_type").isin(eventNames: _*))
-            //            val schemaJson = spark.read.text("/dgn/lts/schema_checkpoints/schema_lts.txt").toDF("col")
-            //            val splitDF = schemaJson.withColumn("column_name", functions.split($"col", ":")(0))
-            //              .withColumn("column_type", functions.split($"col", ":")(1))
-            //              .drop("col")
-            //            val colSchema = splitDF.collect().map { (row: Row) =>
-            //              val column = row.getString(0)
-            //              val datatype = row.getString(1)
-            //              (column.trim(), datatype.trim())
-            //            }.toMap
-            val jsonData = df.toJSON.rdd
-            println("Successfully Convert the json dataframe file to rdd")
-            //jsonData.collect().foreach(println)
-            ///val repRDD = jsonData.repartition(numPartitions)
+      val dateHourWisePaths: Map[(String, Int), List[String]] = dateMap.flatMap { case (date, hourlyLists) =>
+        hourlyLists.zipWithIndex.flatMap { case (hourlyList, hour) =>
+          val falsePaths: List[String] = hourlyList.asInstanceOf[List[(String, Boolean)]].collect { case (path: String, flag: Boolean) if !flag => path }
+          if (falsePaths.nonEmpty) Some((date, hour) -> falsePaths) else None
+        }
+      }.toMap
+      //println(dateHourWisePaths);
+      dateHourWisePaths.foreach { case ((date, hour), paths) =>
+        println("Size of path List that Need to Processed",paths.size)
+        if (paths.nonEmpty) {
+          println("hi")
+          val formattedHour = f"$hour%02d" // Ensure "00", "01", etc.
+          //println(s"Reading data for Date: $date, Hour: $formattedHour, Paths: $paths")
+          val jsondf = spark.read.option("lineSep", "**##**").text(paths: _*)
+          val df = jsondf.withColumn("event_type", get_json_object($"value", "$.event_type")).filter(col("event_type").isin(eventNames: _*))
+          //df.show(false)
+          val jsonData = df.toJSON.rdd
+          println("check2")
+          //jsonData.collect().foreach(println)
+//          val schemaJson = spark.read.text("/data_sdc/projects/chirag/schema_checkpoints/schema.txt").toDF("col")
+//          val splitDF = schemaJson.withColumn("column_name", functions.split($"col", ":")(0))
+//            .withColumn("column_type", functions.split($"col", ":")(1))
+//            .drop("col")
+//          val colSchema = splitDF.collect().map { (row: Row) =>
+//            val column = row.getString(0)
+//            val datatype = row.getString(1)
+//            (column.trim(), datatype.trim())
+//          }.toMap
+//          val repRDD = jsonData.repartition(numPartitions)
+//          var retRDD = repRDD.mapPartitions(partition => {
+//              /** ********* */
+//              val connection = HbaseConnectionUtilProd.getConnection()
+//              val useridToGocidHbaseTbl = connection.getTable(TableName.valueOf(dgn_map_userid_gocid_tbl))
+//              val gocidToUseridHbaseTbl = connection.getTable(TableName.valueOf(dgn_map_gocid_userid_tbl))
+//              val newRDD = partition.map(row => {
+//                if (row != null && row.contains("event_type") && row.contains("ts") && row.contains("user_id")) {
+//                  //                OPrinter.logAndPrint("For row: " + row)
+//                  val gson = new Gson()
+//                  val jsonObject: JsonObject = gson.fromJson(row, classOf[JsonObject])
+//                  val event_name = jsonObject.get("event_type").getAsString
+//                  val epoch_time = jsonObject.get("ts").getAsLong
+//                  val user_id = Option(jsonObject.getAsJsonPrimitive("user_id"))
+//                    .map(_.getAsString)
+//                    .getOrElse("")
+//                  val game_id = "Lucky Time Slots"
+//                  if (user_id == "") {
+//                    //Notifier.sendEMail("dgn_lts@octro.com", s"Data packet doesn't contain user_id for \n : $row", "yash.singhal@octrotalk.com", "Action required : Couldn't process dgn-lts data")
+//                  }
+//                  val rowkey = user_id.trim()
+//                  var getUserData = (rowkey, useridToGocidHbaseTbl.get(new Get(Bytes.toBytes(rowkey))))
+//                  //                OPrinter.logAndPrint(s"Get data from hbase table $ref_user_id")
+//                  var gocid_from_hbase = ""
+//                  try {
+//                    gocid_from_hbase = Bytes.toString(getUserData._2.getValue(Bytes.toBytes("data"), Bytes.toBytes("goc_id"))).toString()
+//                  } catch {
+//                    case e: Exception => {
+//                      //OPrinter.logAndPrint("Inside catch")
+//                    }
+//                  }
+//                  var hbasePut = new Put(Bytes.toBytes(user_id))
+//                  val event_time = Format.epochToDateTime(epoch_time)
+//                  val colList = mapperEventCol(event_name)
+//
+//                  //            if(event_name.equalsIgnoreCase("level_up")){
+//                  var eventValueJson = new JsonObject
+//                  for (col <- colList) {
+//                    //                  OPrinter.logAndPrint(s"$col: $colSchema.get(col)")
+//                    val dataType = colSchema(col)
+//                    val extractedValue: Any = dataType match {
+//                      case "string" => {
+//                        Option(jsonObject.get(col)) match {
+//                          case Some(jsonElement) =>
+//                            val value = jsonElement.getAsString
+//                            eventValueJson.add(col, new JsonPrimitive(value))
+//                          case None =>
+//                            eventValueJson.add(col, JsonNull.INSTANCE)
+//                        }
+//                      }
+//                      case "long" => {
+//                        Option(jsonObject.get(col)) match {
+//                          case Some(jsonElement) =>
+//                            val value = jsonElement.getAsLong
+//                            eventValueJson.add(col, new JsonPrimitive(value))
+//                          case None =>
+//                            eventValueJson.add(col, JsonNull.INSTANCE)
+//                        }
+//                      }
+//                      case "boolean" => {
+//                        Option(jsonObject.get(col)) match {
+//                          case Some(jsonElement) =>
+//                            val value = jsonElement.getAsBoolean
+//                            eventValueJson.add(col, new JsonPrimitive(value))
+//                          case None =>
+//                            eventValueJson.add(col, JsonNull.INSTANCE)
+//                        }
+//                      }
+//                      case "double" => {
+//                        Option(jsonObject.get(col)) match {
+//                          case Some(jsonElement) =>
+//                            val value = jsonElement.getAsDouble
+//                            eventValueJson.add(col, new JsonPrimitive(value))
+//                          case None =>
+//                            eventValueJson.add(col, JsonNull.INSTANCE)
+//                        }
+//                      }
+//                      case "array" => {
+//                        Option(jsonObject.get(col)) match {
+//                          case Some(jsonElement) =>
+//                            val value = jsonElement.getAsJsonObject
+//                            eventValueJson.add(col, value)
+//                          case None =>
+//                            eventValueJson.add(col, JsonNull.INSTANCE)
+//                        }
+//                      }
+//                      case _ => {
+//                        //                      OPrinter.logAndPrint(s"for column $col else datatype: $dataType \n row $row")
+//                        throw new IllegalArgumentException(s"Unsupported data type: $dataType")
+//                      }
+//                    }
+//                  }
+//                  eventValueJson.add("epoch_time", new JsonPrimitive(epoch_time))
+//                  eventValueJson.add("event_time", new JsonPrimitive(event_time))
+//                  eventValueJson.add("user_id_numeric", new JsonPrimitive(user_id))
+//
+//                  var goc_id = ""
+//                  if (gocid_from_hbase != "") {
+//                    //                  OPrinter.logAndPrint("Inside if line 251: " + gocid_from_hbase)
+//                    goc_id = gocid_from_hbase
+//                  }
+//                  else {
+//                    accum.add(1)
+//                    OPrinter.logAndPrint(s"Fetching gocid for $user_id")
+//                    val response = getGOCIDfromUSERID(user_id)
+//                    val outerJson = stringToJsonConverter(response)
+//                    val innerJson = stringToJsonConverter(outerJson.get("body").getAsString)
+//                    goc_id = innerJson.get("body").getAsJsonObject.get("GOCID").getAsString
+//                    if (goc_id != "") {
+//                      hbasePut.addColumn("data".getBytes, "goc_id".getBytes, goc_id.toString().getBytes)
+//                      useridToGocidHbaseTbl.put(hbasePut)
+//                    }
+//                    // Now putting user_id corresponding to this goc_id in dgn_map_gocid_userid_tbl
+//                    var hbasePut2 = new Put(Bytes.toBytes(goc_id))
+//                    hbasePut2.addColumn("data".getBytes, "numeric_id".getBytes, user_id.toString().getBytes)
+//                    gocidToUseridHbaseTbl.put(hbasePut2)
+//                  }
+//                  val mainJson = new JsonObject
+//                  mainJson.addProperty("game_id", game_id)
+//                  mainJson.addProperty("event_time", event_time)
+//                  mainJson.addProperty("event_name", event_name)
+//                  mainJson.addProperty("user_id", goc_id)
+//                  mainJson.add("event_value", eventValueJson)
+//
+//                  //OPrinter.logAndPrint("Value of no. of API hits for this hour: " + no_of_hits)
+//                  (mainJson.toString, game_id, goc_id, event_time, event_name, eventValueJson.toString)
+//                  //(event_name, event_time, game_id, hashed_user_id, eventValueJson.toString)
+//                }
+//                else {
+//                  //Notifier.sendEMail("dgn_lts@octro.com", s"Data packet is missing some key for \n : $row", "yash.singhal@octrotalk.com", "Action required : Couldn't process dgn-lts data")
+//                  //            OPrinter.logAndPrint("Else row" + row)
+//                  ("", "", "", "", "", "")
+//                }
+//              })
+//              newRDD
+//            })
+//            .persist()
+//          OPrinter.logAndPrint(s"retRDD data count: ${retRDD.count()}")
+//          var empty_gocidRDD = retRDD
+//            .filter(row => {
+//              val jsoStr = stringToJsonConverter(row._1)
+//              jsoStr.has("user_id") && jsoStr.get("user_id").getAsString.isEmpty
+//            })
+//          if (!empty_gocidRDD.isEmpty()) {
+//            val empty_gocid_count = empty_gocidRDD.count()
+//            val sample_rec = empty_gocidRDD.take(5).mkString("\n")
+//            OPrinter.logAndPrint(s"Didn't receive goc_id for these packets ${sample_rec}")
+//            //Notifier.sendEMail("dgn_ovs@octro.com", s"Didn't receive goc_id for these no. of records ${empty_gocid_count} \n Sample records are: \n ${sample_rec}", "yash.singhal@octrotalk.com", "Action required : Couldn't get gocid for dgn-ovs data")
+//            spark.sparkContext.stop()
+//          }
+//          var non_emptyRDD = retRDD.filter(row => {
+//            val jsoStr = stringToJsonConverter(row._1)
+//            jsoStr.has("user_id") && jsoStr.get("user_id").getAsString.nonEmpty
+//          })
+//          OPrinter.logAndPrint(s"Final data count: ${non_emptyRDD.count()}")
+//
+//          val lastReadDateHour = date + "/" + hour.toString
+//
+//          OPrinter.logAndPrint(s"Writing data on hdfs for $lastReadDateHour")
+//
+//          //non_emptyRDD.map(x => x._1).saveAsTextFile(s"/dgn/lts/kafka_events_new/$lastReadDateHour")
+//          OPrinter.logAndPrint(s"Data saved on hdfs successfully")
+//          val outputPath = new Path(s"/dgn/lts/kafka_events_new/$lastReadDateHour")
+//          val fs = FileSystem.get(spark.sparkContext.hadoopConfiguration)
+//          val appendStream = if (fs.exists(outputPath)) {
+//            fs.append(outputPath) // Append to existing file
+//          } else {
+//            fs.create(outputPath) // Create a new file if it doesn't exist
+//          }
+//          val writer = new OutputStreamWriter(appendStream)
+//          non_emptyRDD.map(_._1).collect().foreach(line => writer.write(line + "\n"))
+//          //commenting the kafka code -------->by yash
+//          //OPrinter.logAndPrint(s"Pushing $hour hour data to kafka topic $dgnLtsTopic")
+//          //OKafkaProducer.pushToTopic(dgnLtsTopic, non_emptyRDD.map(x => x._1))
+//          //OPrinter.logAndPrint(s"Data saved to kafka topic $dgnLtsTopic")
+//          retRDD.unpersist()
+//          OPrinter.logAndPrint(s"Value of no. of API hits for $hour: ${accum.value}")
+          //put in the hbase of processing
+          val put = new Put(Bytes.toBytes(date))
+          val columnFamily = "hour_data"
+          val columnQualifier = f"$hour%02d"
+          println("Reached to write the data in the hbase")
+          val allPathsList = dateMap.get(date)
+            .flatMap(_.lift(hour))
+            .map(_.collect { case (path, _) => path })
+            .getOrElse(Nil)
+          //println(allPathsList)
 
-            //            var retRDD = repRDD.mapPartitions(partition => {
-            //                /** ********* */
-            //                val connection = HbaseConnectionUtilProd.getConnection()
-            //                val useridToGocidHbaseTbl = connection.getTable(TableName.valueOf(dgn_map_userid_gocid_tbl))
-            //                val gocidToUseridHbaseTbl = connection.getTable(TableName.valueOf(dgn_map_gocid_userid_tbl))
-            //                val newRDD = partition.map(row => {
-            //                  if (row != null && row.contains("event_type") && row.contains("ts") && row.contains("user_id")) {
-            //                    //                OPrinter.logAndPrint("For row: " + row)
-            //                    val gson = new Gson()
-            //                    val jsonObject: JsonObject = gson.fromJson(row, classOf[JsonObject])
-            //
-            //                    val event_name = jsonObject.get("event_type").getAsString
-            //                    val epoch_time = jsonObject.get("ts").getAsLong
-            //                    val user_id = Option(jsonObject.getAsJsonPrimitive("user_id"))
-            //                      .map(_.getAsString)
-            //                      .getOrElse("")
-            //
-            //                    val game_id = "Lucky Time Slots"
-            //
-            //                    if (user_id == "") {
-            //                      Notifier.sendEMail("dgn_lts@octro.com", s"Data packet doesn't contain user_id for \n : $row", "shreyansh.maurya@octrotalk.com,govind.gopal@octrotalk.com,akashdeep.singh@octrotalk.com", "Action required : Couldn't process dgn-lts data")
-            //                    }
-            //
-            //                    val rowkey = user_id.trim()
-            //                    var getUserData = (rowkey, useridToGocidHbaseTbl.get(new Get(Bytes.toBytes(rowkey))))
-            //
-            //                    //                OPrinter.logAndPrint(s"Get data from hbase table $ref_user_id")
-            //                    var gocid_from_hbase = ""
-            //                    try {
-            //                      gocid_from_hbase = Bytes.toString(getUserData._2.getValue(Bytes.toBytes("data"), Bytes.toBytes("goc_id"))).toString()
-            //                    } catch {
-            //                      case e: Exception => {
-            //                        //                    OPrinter.logAndPrint("Inside catch")
-            //                      }
-            //                    }
-            //                    //                OPrinter.logAndPrint(s"Get data from hbase table $gocid_from_hbase")
-            //
-            //                    var hbasePut = new Put(Bytes.toBytes(user_id))
-            //                    val event_time = Format.epochToDateTime(epoch_time)
-            //
-            //                    val colList = mapperEventCol(event_name)
-            //
-            //                    //            if(event_name.equalsIgnoreCase("level_up")){
-            //                    var eventValueJson = new JsonObject
-            //                    for (col <- colList) {
-            //                      //                  OPrinter.logAndPrint(s"$col: $colSchema.get(col)")
-            //                      val dataType = colSchema(col)
-            //                      val extractedValue: Any = dataType match {
-            //                        case "string" => {
-            //                          Option(jsonObject.get(col)) match {
-            //                            case Some(jsonElement) =>
-            //                              val value = jsonElement.getAsString
-            //                              eventValueJson.add(col, new JsonPrimitive(value))
-            //                            case None =>
-            //                              eventValueJson.add(col, JsonNull.INSTANCE)
-            //                          }
-            //                        }
-            //                        case "long" => {
-            //                          Option(jsonObject.get(col)) match {
-            //                            case Some(jsonElement) =>
-            //                              val value = jsonElement.getAsLong
-            //                              eventValueJson.add(col, new JsonPrimitive(value))
-            //                            case None =>
-            //                              eventValueJson.add(col, JsonNull.INSTANCE)
-            //                          }
-            //                        }
-            //                        case "boolean" => {
-            //                          Option(jsonObject.get(col)) match {
-            //                            case Some(jsonElement) =>
-            //                              val value = jsonElement.getAsBoolean
-            //                              eventValueJson.add(col, new JsonPrimitive(value))
-            //                            case None =>
-            //                              eventValueJson.add(col, JsonNull.INSTANCE)
-            //                          }
-            //                        }
-            //                        case "double" => {
-            //                          Option(jsonObject.get(col)) match {
-            //                            case Some(jsonElement) =>
-            //                              val value = jsonElement.getAsDouble
-            //                              eventValueJson.add(col, new JsonPrimitive(value))
-            //                            case None =>
-            //                              eventValueJson.add(col, JsonNull.INSTANCE)
-            //                          }
-            //                        }
-            //                        case "array" => {
-            //                          Option(jsonObject.get(col)) match {
-            //                            case Some(jsonElement) =>
-            //                              val value = jsonElement.getAsJsonObject
-            //                              eventValueJson.add(col, value)
-            //                            case None =>
-            //                              eventValueJson.add(col, JsonNull.INSTANCE)
-            //                          }
-            //                        }
-            //                        case _ => {
-            //                          //                      OPrinter.logAndPrint(s"for column $col else datatype: $dataType \n row $row")
-            //                          throw new IllegalArgumentException(s"Unsupported data type: $dataType")
-            //                        }
-            //                      }
-            //
-            //                    }
-            //                    eventValueJson.add("epoch_time", new JsonPrimitive(epoch_time))
-            //                    eventValueJson.add("event_time", new JsonPrimitive(event_time))
-            //                    eventValueJson.add("user_id_numeric", new JsonPrimitive(user_id))
-            //
-            //                    var goc_id = ""
-            //                    if (gocid_from_hbase != "") {
-            //                      //                  OPrinter.logAndPrint("Inside if line 251: " + gocid_from_hbase)
-            //                      goc_id = gocid_from_hbase
-            //                    }
-            //                    else {
-            //                      accum.add(1)
-            //                      OPrinter.logAndPrint(s"Fetching gocid for $user_id")
-            //                      val response = getGOCIDfromUSERID(user_id)
-            //                      val outerJson = stringToJsonConverter(response)
-            //                      //                  val innerJson = outerJson.get("body").getAsJsonObject
-            //                      //                  val goc_id = innerJson.get("GOCID").getAsString
-            //                      val innerJson = stringToJsonConverter(outerJson.get("body").getAsString)
-            //                      //                  println("innerJson "+innerJson)
-            //                      goc_id = innerJson.get("body").getAsJsonObject.get("GOCID").getAsString
-            //                      //                  val goc_id= getGOCIDfromUSERID(ref_user_id)
-            //
-            //                      if (goc_id != "") {
-            //                        //                OPrinter.logAndPrint("Inside if line 262: " + goc_id)
-            //                        hbasePut.addColumn("data".getBytes, "goc_id".getBytes, goc_id.toString().getBytes)
-            //                        useridToGocidHbaseTbl.put(hbasePut)
-            //                      }
-            //
-            //                      // Now putting user_id corresponding to this goc_id in dgn_map_gocid_userid_tbl
-            //                      var hbasePut2 = new Put(Bytes.toBytes(goc_id))
-            //                      hbasePut2.addColumn("data".getBytes, "numeric_id".getBytes, user_id.toString().getBytes)
-            //                      gocidToUseridHbaseTbl.put(hbasePut2)
-            //                    }
-            //                    val mainJson = new JsonObject
-            //                    mainJson.addProperty("game_id", game_id)
-            //                    mainJson.addProperty("event_time", event_time)
-            //                    mainJson.addProperty("event_name", event_name)
-            //                    mainJson.addProperty("user_id", goc_id)
-            //                    mainJson.add("event_value", eventValueJson)
-            //
-            //                    //                OPrinter.logAndPrint("Value of no. of API hits for this hour: " + no_of_hits)
-            //                    (mainJson.toString, game_id, goc_id, event_time, event_name, eventValueJson.toString)
-            //                    //            (event_name, event_time, game_id, hashed_user_id, eventValueJson.toString)
-            //                  }
-            //                  else {
-            //                    Notifier.sendEMail("dgn_lts@octro.com", s"Data packet is missing some key for \n : $row", "shreyansh.maurya@octrotalk.com,govind.gopal@octrotalk.com,akashdeep.singh@octrotalk.com", "Action required : Couldn't process dgn-lts data")
-            //                    //            OPrinter.logAndPrint("Else row" + row)
-            //                    ("", "", "", "", "", "")
-            //                  }
-            //                })
-            //                newRDD
-            //              })
-            //              .persist()
-            //            jsonRDD.take(10).foreach(println)
-            //            OPrinter.logAndPrint(s"retRDD data count: ${retRDD.count()}")
-            //            var empty_gocidRDD = retRDD
-            //              .filter(row => {
-            //                val jsoStr = stringToJsonConverter(row._1)
-            //                jsoStr.has("user_id") && jsoStr.get("user_id").getAsString.isEmpty
-            //              })
-            //            if (!empty_gocidRDD.isEmpty()) {
-            //              val empty_gocid_count = empty_gocidRDD.count()
-            //              val sample_rec = empty_gocidRDD.take(5).mkString("\n")
-            //              OPrinter.logAndPrint(s"Didn't receive goc_id for these packets ${sample_rec}")
-            //              Notifier.sendEMail("dgn_ovs@octro.com", s"Didn't receive goc_id for these no. of records ${empty_gocid_count} \n Sample records are: \n ${sample_rec}", "shreyansh.maurya@octrotalk.com,govind.gopal@octrotalk.com,akashdeep.singh@octrotalk.com", "Action required : Couldn't get gocid for dgn-ovs data")
-            //              spark.sparkContext.stop()
-            //            }
-            //            var non_emptyRDD = retRDD.filter(row => {
-            //              val jsoStr = stringToJsonConverter(row._1)
-            //              jsoStr.has("user_id") && jsoStr.get("user_id").getAsString.nonEmpty
-            //            })
-            //            OPrinter.logAndPrint(s"Final data count: ${non_emptyRDD.count()}")
-            //
-            //            //commenting the kafka code -------->by yash
-            //            //OPrinter.logAndPrint(s"Pushing $hour hour data to kafka topic $dgnLtsTopic")
-            //            //OKafkaProducer.pushToTopic(dgnLtsTopic, non_emptyRDD.map(x => x._1))
-            //            //OPrinter.logAndPrint(s"Data saved to kafka topic $dgnLtsTopic")
-            //
-            //            retRDD.unpersist()
-            //            OPrinter.logAndPrint(s"Value of no. of API hits for $hour: ${accum.value}")
-            //put in the hbase of processing
-            val put = new Put(Bytes.toBytes(date))
-            val columnFamily = "hour_data"
-            val columnQualifier = hour
-            val allPathsString=allPaths.mkString(",")
-            put.addColumn(Bytes.toBytes(columnFamily), Bytes.toBytes(columnQualifier), Bytes.toBytes(allPathsString))
+          if (allPathsList.nonEmpty) {
+            put.addColumn(Bytes.toBytes(columnFamily), Bytes.toBytes(columnQualifier), Bytes.toBytes(allPathsList.mkString(",")))
             table.put(put)
             OPrinter.logAndPrint("Data Write Successfully in the Hbase")
           }
-          OPrinter.logAndPrint(s"Value of no. of API hits for $hour: ${accum.value}")
+          else {
+            OPrinter.logAndPrint(s"No data is available for the ${date}/${hour} in the HDFS")
+          }
+        }
+        OPrinter.logAndPrint(s"Value of no. of API hits for : ${accum.value}")
       }
     }
     catch {
-      case e: Exception =>
+      case e: Exception => {
+        OPrinter.logAndPrint("************************************************************************************************************************************")
         OPrinter.logAndPrint("Spark Context Stopped")
+        OPrinter.logAndPrint("************************************************************************************************************************************")
         spark.sparkContext.stop()
-        //        Notifier.sendEMail(
-        //          "dgn_lts@octro.com",
-        //          s"Error occurred in dgn_lts connector: ${e.getMessage}",
-        //          "shreyansh.maurya@octrotalk.com,govind.gopal@octrotalk.com,akashdeep.singh@octrotalk.com",
-        //          "Action required : Couldn't process dgn-lts data"
-        //        )
+        //          val stackTrace = "com.octro.start.main.StartMain :: " + ExceptionUtils.getStackTrace(e) + "<br/><br/>"
+        //          Notifier.sendEMail("dgn_ovs@octro.com", s"Error occurred in dgn_ovs connector for date $start_date hour $hour " + "\n<br/>" + e.getMessage + "\n<br/>stackTrace = " + stackTrace, "simran.maurya@octrotalk.com", "Action required : Couldn't process dgn-ovs data")
+        //Notifier.sendEMail("dgn_lts@octro.com", s"Error occurred in dgn_lts connector" + e.getMessage, "yash.singhal@octrotalk.com", "Action required : Couldn't process dgn-lts data")
         OPrinter.logAndPrint(e.getMessage)
+      }
     }
-    finally {
-      table.close()
-      connection.close()
     }
-  }
   def dirExists(hdfsDirectory: String): Boolean = {
     val hadoopConf = new org.apache.hadoop.conf.Configuration()
     val fs = org.apache.hadoop.fs.FileSystem.get(hadoopConf)
@@ -458,8 +448,10 @@ object DgnOvsEventsV2 {
     }
     catch {
       case e: Exception => {
+        OPrinter.logAndPrint("Inside Catch Block as {")
         val stackTrace = "com.octro.start.main.StartMain :: " + ExceptionUtils.getStackTrace(e) + "<br/><br/>"
-        Notifier.sendEMail("dgn_lts@octro.com", s"Error occurred while fetching gocid for userid $guestId  " + "\n<br/>" + e.getMessage + "\n<br/>stackTrace = " + stackTrace, "shreyansh.maurya@octrotalk.com,govind.gopal@octrotalk.com,akashdeep.singh@octrotalk.com", "Action required : Couldn't fetch gocid from api")
+        OPrinter.logAndPrint(s"Inside Catch Block as ${e}")
+        //Notifier.sendEMail("dgn_lts@octro.com", s"Error occurred while fetching gocid for userid $guestId  " + "\n<br/>" + e.getMessage + "\n<br/>stackTrace = " + stackTrace, "shreyansh.maurya@octrotalk.com,govind.gopal@octrotalk.com,akashdeep.singh@octrotalk.com", "Action required : Couldn't fetch gocid from api")
         ""
       }
     }
